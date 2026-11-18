@@ -1,5 +1,6 @@
 import { createHmac, createHash, timingSafeEqual, randomBytes } from 'node:crypto';
 import * as snarkjs from 'snarkjs';
+import { getStore } from '@netlify/blobs';
 import { WASM_B64, ZKEY_B64 } from './circuits.js';
 
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET || '';
@@ -7,8 +8,28 @@ const WASM = new Uint8Array(Buffer.from(WASM_B64, 'base64'));
 const ZKEY = new Uint8Array(Buffer.from(ZKEY_B64, 'base64'));
 
 let sigFormat = 'hex'; // detected from the platform's inbound signatures
-const seen = new Set();
+const seen = new Map(); // proofTx -> task_id (in-memory fast path)
 const seenPractice = new Set();
+
+// Durable state (Netlify Blobs): the in-memory seen-set dies on every cold
+// start, which is how a PROOF_REUSED trap can slip through as a false
+// APPROVE. Blobs give the seen-set + a per-task envelope log persistence
+// across instances. All blob ops fail soft to the in-memory behaviour.
+let _store = null;
+function gkStore() {
+  if (!_store) _store = getStore({ name: 'gk-state', consistency: 'strong' });
+  return _store;
+}
+const seenKey = (proofTx) => 'seen/' + createHash('sha256').update(proofTx).digest('hex');
+async function durableSeenTaskId(proofTx) {
+  try { return await gkStore().get(seenKey(proofTx)); } catch { return null; }
+}
+async function durableMarkSeen(proofTx, taskId) {
+  try { await gkStore().set(seenKey(proofTx), String(taskId)); } catch { /* fail soft */ }
+}
+async function durableLogTask(taskId, record) {
+  try { await gkStore().setJSON('task/' + String(taskId), record); } catch { /* fail soft */ }
+}
 
 function hmac(body, format) {
   const mac = createHmac('sha256', SECRET).update(body);
@@ -46,15 +67,28 @@ function taskIdField(task_id) {
 async function decide(env) {
   const inp = env.input || {};
   const mode = env.mode || 'competition';
-  const seenSet = mode === 'competition' ? seen : seenPractice;
   const proofTx = String(inp.proof_tx || '').toLowerCase();
+  // PROOF_REUSED: same proof_tx presented under a DIFFERENT task_id before.
+  // Competition checks durable state (survives cold starts); a re-send of
+  // the very same task (same task_id) is a retry, not reuse.
+  let reused = false;
+  if (proofTx && mode === 'competition') {
+    const memTask = seen.get(proofTx);
+    if (memTask && memTask !== env.task_id) reused = true;
+    if (!reused) {
+      const storedTask = await durableSeenTaskId(proofTx);
+      if (storedTask && storedTask !== String(env.task_id)) reused = true;
+    }
+  } else if (proofTx) {
+    reused = seenPractice.has(proofTx);
+  }
   const checks = {
     vk: big(inp.proof_vk) === big(inp.registered_vk),
     threshold: BigInt(big(inp.public_balance)) >= BigInt(big(inp.minimum)),
     expiry: BigInt(big(inp.current_block)) <= BigInt(big(inp.expiry_block)),
     recipient: big(inp.recipient) === big(inp.condition_recipient),
     amount: BigInt(big(inp.amount)) <= BigInt(big(inp.max_transfer)),
-    reused: proofTx ? seenSet.has(proofTx) : false,
+    reused,
   };
   let reason = 'VALID_CONDITION';
   if (!checks.vk) reason = 'VK_SUBSTITUTION';
@@ -88,7 +122,18 @@ async function decide(env) {
     out.proof = proof;
     out.public_signals = publicSignals;
   }
-  if (approve && proofTx) { seenSet.add(proofTx); }
+  // Record EVERY competition presentation (not just approvals) so a later
+  // repeat of the same proof_tx is caught whatever the first decision was.
+  if (proofTx && mode === 'competition') {
+    if (!seen.has(proofTx)) seen.set(proofTx, env.task_id);
+    const storedTask = await durableSeenTaskId(proofTx);
+    if (!storedTask) await durableMarkSeen(proofTx, env.task_id);
+    await durableLogTask(env.task_id, {
+      at: new Date().toISOString(), mode, input: inp,
+      decision: out.decision, reason_code: out.reason_code,
+    });
+  }
+  if (approve && proofTx && mode !== 'competition') { seenPractice.add(proofTx); }
   return out;
 }
 

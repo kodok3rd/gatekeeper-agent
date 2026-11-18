@@ -4,5 +4,8 @@
   "type": "module",
   "private": true,
   "description": "Proof Gatekeeper agent for the zkVerify Agent Games: verifies signed task envelopes and answers with Groth16 proofs of its decisions.",
-  "dependencies": { "snarkjs": "0.7.6" }
+  "dependencies": {
+    "snarkjs": "0.7.6",
+    "@netlify/blobs": "^11.1.9"
+  }
 }
